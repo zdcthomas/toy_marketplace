@@ -181,7 +181,6 @@ fn handle_meta_transaction(
     client_list: &mut ClientList,
     transaction_list: &mut TransactionList,
 ) -> Result<()> {
-    // make hashmap of standard transactions
     let target_transaction =
         if let Some(target) = transaction_list.get_mut(&transaction.transaction_id) {
             target
