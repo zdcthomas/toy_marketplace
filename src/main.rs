@@ -1,10 +1,14 @@
+use anyhow::anyhow;
+use anyhow::Context;
+use anyhow::Ok;
+use anyhow::Result;
 use clap::Parser;
 use csv::WriterBuilder;
 use rust_decimal::prelude::*;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
-use std::io::{self, Write};
-use std::{collections::HashMap, error::Error, fs::File, path::PathBuf};
+use std::io;
+use std::{collections::HashMap, fs::File, path::PathBuf};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -13,7 +17,7 @@ struct Args {
     file: PathBuf,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 #[serde(rename_all = "lowercase")]
 enum TransactionType {
     Deposit,
@@ -85,23 +89,7 @@ impl Client {
     }
 }
 
-// should use the referenced transaction
-fn dispute(client: &mut Client, transaction: &Transaction) {
-    client.hold(transaction.amount.unwrap());
-}
-
-// should use the referenced transaction
-fn resolve(client: &mut Client, transaction: &Transaction) {
-    client.release(transaction.amount.unwrap());
-}
-
-// should use the referenced transaction
-fn chargeback(client: &mut Client, transaction: &Transaction) {
-    client.withdraw(transaction.amount.unwrap());
-    client.freeze()
-}
-
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 struct Transaction {
     #[serde(rename(deserialize = "type"))]
     transaction_type: TransactionType,
@@ -112,37 +100,100 @@ struct Transaction {
     amount: Option<Decimal>,
 }
 
-fn handle_transaction(transaction: Transaction, client_list: &mut HashMap<u16, Client>) {
-    if !client_list.contains_key(&transaction.client) {
-        client_list.insert(transaction.client, Client::new(transaction.client));
-    };
-    let client = client_list.get_mut(&transaction.client).unwrap();
-
-    match transaction.transaction_type {
-        TransactionType::Deposit => client.deposit(transaction.amount.unwrap()),
-        TransactionType::Withdrawl => client.withdraw(transaction.amount.unwrap()),
-        TransactionType::Dispute => dispute(client, &transaction),
-        TransactionType::Resolve => resolve(client, &transaction),
-        TransactionType::ChargeBack => chargeback(client, &transaction),
+impl Transaction {
+    fn amount(&self) -> Result<Decimal> {
+        match self.amount {
+            Some(amount) => Ok(amount),
+            None => Err(anyhow!("No amount field in Transaction: {:?}", self)),
+        }
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+type TransactionList = Vec<Transaction>;
+type ClientList = HashMap<u16, Client>;
+
+fn handle_transaction(
+    transaction: Transaction,
+    client_list: &mut ClientList,
+    // refactor to hashmap
+    transaction_list: &mut TransactionList,
+) -> Result<()> {
+    if !client_list.contains_key(&transaction.client) {
+        client_list.insert(transaction.client, Client::new(transaction.client));
+    };
+
+    if !transaction_list.contains(&transaction) {
+        transaction_list.push(transaction.clone());
+    }
+
+    // This should never error, since we instered the client above
+    let client = client_list.get_mut(&transaction.client).unwrap();
+
+    match transaction.transaction_type {
+        TransactionType::Deposit => {
+            client.deposit(transaction.amount().context("Deposit type transaction")?)
+        }
+        TransactionType::Withdrawl => {
+            client.withdraw(transaction.amount().context("Withdrawl type transaction")?)
+        }
+        TransactionType::Dispute => {
+            if let Some(target_transaction) = transaction_list
+                .iter()
+                .find(|tran| tran.tx == transaction.tx)
+            {
+                client.hold(
+                    target_transaction
+                        .amount()
+                        .context("Targeted from Dispute transaction")?,
+                )
+            };
+        }
+        TransactionType::Resolve => {
+            if let Some(target_transaction) = transaction_list
+                .iter()
+                .find(|tran| tran.tx == transaction.tx)
+            {
+                client.release(
+                    target_transaction
+                        .amount()
+                        .context("Targeted from Resolve transaction")?,
+                )
+            };
+        }
+        TransactionType::ChargeBack => {
+            if let Some(target_transaction) = transaction_list
+                .iter()
+                .find(|tran| tran.tx == transaction.tx)
+            {
+                client.withdraw(
+                    target_transaction
+                        .amount()
+                        .context("Targeted from chargeback transaction")?,
+                );
+                client.freeze();
+            };
+        }
+    };
+    Ok(())
+}
+
+fn main() -> Result<()> {
     let args = Args::parse();
     let file = File::open(args.file)?;
 
     let mut rdr = csv::Reader::from_reader(file);
-    let mut client_list: HashMap<u16, Client> = HashMap::new();
+    let mut client_list: ClientList = HashMap::new();
+    let mut transaction_list: TransactionList = vec![];
 
     for result in rdr.deserialize() {
         let transaction: Transaction = result?;
-        handle_transaction(transaction, &mut client_list);
+        handle_transaction(transaction, &mut client_list, &mut transaction_list)?;
     }
 
     let handle = io::stdout().lock();
     let mut wtr = WriterBuilder::new().from_writer(handle);
     for ele in client_list.into_values() {
-        wtr.serialize(ele).unwrap();
+        wtr.serialize(ele)?;
     }
     Ok(())
 }
@@ -153,7 +204,8 @@ mod tests {
 
     #[test]
     fn handle_transaction_deposit_test() {
-        let mut client_list: HashMap<u16, Client> = HashMap::new();
+        let mut client_list: ClientList = HashMap::new();
+        let mut transaction_list: TransactionList = vec![];
 
         let client_id = 1;
 
@@ -167,7 +219,9 @@ mod tests {
                 amount: Some(transaction_amount),
             },
             &mut client_list,
-        );
+            &mut transaction_list,
+        )
+        .unwrap();
 
         assert_eq!(
             &Client {
@@ -188,7 +242,9 @@ mod tests {
                 amount: Some(dec!(5.0000)),
             },
             &mut client_list,
-        );
+            &mut transaction_list,
+        )
+        .unwrap();
 
         assert_eq!(
             &Client {
@@ -252,5 +308,10 @@ mod tests {
         let mut client = Client::new(1);
         client.freeze();
         assert!(client.locked);
+    }
+
+    #[test]
+    fn dispute_should_() {
+        unimplemented!();
     }
 }
