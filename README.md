@@ -1,5 +1,5 @@
 # Toy marketplace challenge
-(./spec.md)[Project spec]
+See [project specification](./spec.md) for more details
 
 ## Arch decisions
 
