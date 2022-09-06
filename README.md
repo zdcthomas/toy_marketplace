@@ -37,3 +37,16 @@ See [project specification](./spec.md) for more details
   of an entire other data structure for the meta transactions).
 
   This is main decision I'd reevaluate if I had more time.
+
+## If I had more time
+
+### Test coverage
+  Right now the test coverage is fairly spartan, and I'd like to shore it up
+  more, especially with some larger integration tests.
+
+### Remove nearly all expects
+  There are a few truly impossible states in this app, and in some of
+  these states (especially `None` values when retrieving from lists) I
+  opted for simply expecting or unwrapping these values. But other times
+  there are states that are only possible through function misuse, and
+  these I should be bubbling up.
