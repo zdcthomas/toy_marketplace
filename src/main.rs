@@ -27,7 +27,7 @@ enum TransactionType {
     ChargeBack,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(rename_all = "lowercase")]
 struct Client {
     #[serde(rename(serialize = "client"))]
@@ -93,11 +93,19 @@ impl Client {
 struct Transaction {
     #[serde(rename(deserialize = "type"))]
     transaction_type: TransactionType,
-    client: u16,
-    tx: u32,
+
+    #[serde(rename(deserialize = "client"))]
+    client_id: u16,
+
+    #[serde(rename(deserialize = "tx"))]
+    transaction_id: u32,
 
     #[serde(with = "rust_decimal::serde::arbitrary_precision_option")]
     amount: Option<Decimal>,
+
+    // bool::default is false
+    #[serde(default)]
+    disputed: bool,
 }
 
 impl Transaction {
@@ -109,7 +117,7 @@ impl Transaction {
     }
 }
 
-type TransactionList = Vec<Transaction>;
+type TransactionList = HashMap<u32, Transaction>;
 type ClientList = HashMap<u16, Client>;
 
 fn handle_transaction(
@@ -118,16 +126,43 @@ fn handle_transaction(
     // refactor to hashmap
     transaction_list: &mut TransactionList,
 ) -> Result<()> {
-    if !client_list.contains_key(&transaction.client) {
-        client_list.insert(transaction.client, Client::new(transaction.client));
+    // We always want to add the client from the transaction to the client list
+    if !client_list.contains_key(&transaction.client_id) {
+        client_list.insert(transaction.client_id, Client::new(transaction.client_id));
     };
 
-    if !transaction_list.contains(&transaction) {
-        transaction_list.push(transaction.clone());
-    }
+    /*
+    We only want to add the transaction to the transaction list if it's a standard transaction.
+    Otherwise, the meta transaction would overwrite the transaction it's referencing.
 
-    // This should never error, since we instered the client above
-    let client = client_list.get_mut(&transaction.client).unwrap();
+    In future, if needed, we could create a meta transactions list to track those, but right now,
+    it's not necessary.
+    */
+    match transaction.transaction_type {
+        TransactionType::Deposit | TransactionType::Withdrawl => {
+            handle_standard_transaction(transaction, client_list, transaction_list)?;
+        }
+        _ => handle_meta_transaction(transaction, client_list, transaction_list)?,
+    };
+    Ok(())
+}
+
+fn handle_standard_transaction(
+    transaction: Transaction,
+    client_list: &mut ClientList,
+    transaction_list: &mut TransactionList,
+) -> Result<()> {
+    let transaction_id = transaction.transaction_id;
+
+    // Make hashmap
+    transaction_list.insert(transaction_id, transaction);
+
+    // should never panic since we just inserted it
+    let transaction = transaction_list.get_mut(&transaction_id).unwrap();
+
+    let client = client_list
+        .get_mut(&transaction.client_id)
+        .expect("handle_standard_transaction called on transaction with non existing client");
 
     match transaction.transaction_type {
         TransactionType::Deposit => {
@@ -136,43 +171,55 @@ fn handle_transaction(
         TransactionType::Withdrawl => {
             client.withdraw(transaction.amount().context("Withdrawl type transaction")?)
         }
-        TransactionType::Dispute => {
-            if let Some(target_transaction) = transaction_list
-                .iter()
-                .find(|tran| tran.tx == transaction.tx)
-            {
-                client.hold(
-                    target_transaction
-                        .amount()
-                        .context("Targeted from Dispute transaction")?,
-                )
-            };
-        }
+        _ => panic!("handle_standard_transaction called with non standard transaction"),
+    }
+    Ok(())
+}
+
+fn handle_meta_transaction(
+    transaction: Transaction,
+    client_list: &mut ClientList,
+    transaction_list: &mut TransactionList,
+) -> Result<()> {
+    // make hashmap of standard transactions
+    let target_transaction =
+        if let Some(target) = transaction_list.get_mut(&transaction.transaction_id) {
+            target
+        } else {
+            return Ok(());
+        };
+
+    let client = client_list
+        .get_mut(&transaction.client_id)
+        .expect("handle_standard_transaction called on transaction with non existing client");
+
+    match transaction.transaction_type {
+        TransactionType::Dispute => client.hold(
+            target_transaction
+                .amount()
+                .context("Targeted from Dispute transaction")?,
+        ),
         TransactionType::Resolve => {
-            if let Some(target_transaction) = transaction_list
-                .iter()
-                .find(|tran| tran.tx == transaction.tx)
-            {
+            if target_transaction.disputed {
                 client.release(
                     target_transaction
                         .amount()
                         .context("Targeted from Resolve transaction")?,
-                )
-            };
+                );
+            }
         }
+
         TransactionType::ChargeBack => {
-            if let Some(target_transaction) = transaction_list
-                .iter()
-                .find(|tran| tran.tx == transaction.tx)
-            {
+            if target_transaction.disputed {
                 client.withdraw(
                     target_transaction
                         .amount()
                         .context("Targeted from chargeback transaction")?,
                 );
                 client.freeze();
-            };
+            }
         }
+        _ => panic!("handle_meta_transaction called on standard transaction"),
     };
     Ok(())
 }
@@ -183,7 +230,7 @@ fn main() -> Result<()> {
 
     let mut rdr = csv::Reader::from_reader(file);
     let mut client_list: ClientList = HashMap::new();
-    let mut transaction_list: TransactionList = vec![];
+    let mut transaction_list: TransactionList = HashMap::new();
 
     for result in rdr.deserialize() {
         let transaction: Transaction = result?;
@@ -191,9 +238,9 @@ fn main() -> Result<()> {
     }
 
     let handle = io::stdout().lock();
-    let mut wtr = WriterBuilder::new().from_writer(handle);
+    let mut writer = WriterBuilder::new().from_writer(handle);
     for ele in client_list.into_values() {
-        wtr.serialize(ele)?;
+        writer.serialize(ele)?;
     }
     Ok(())
 }
@@ -205,7 +252,7 @@ mod tests {
     #[test]
     fn handle_transaction_deposit_test() {
         let mut client_list: ClientList = HashMap::new();
-        let mut transaction_list: TransactionList = vec![];
+        let mut transaction_list: TransactionList = HashMap::new();
 
         let client_id = 1;
 
@@ -213,10 +260,11 @@ mod tests {
 
         handle_transaction(
             Transaction {
-                client: client_id,
                 transaction_type: TransactionType::Deposit,
-                tx: 1,
+                client_id,
+                transaction_id: 1,
                 amount: Some(transaction_amount),
+                disputed: false,
             },
             &mut client_list,
             &mut transaction_list,
@@ -236,10 +284,11 @@ mod tests {
 
         handle_transaction(
             Transaction {
-                client: client_id,
                 transaction_type: TransactionType::Deposit,
-                tx: 1,
+                client_id,
+                transaction_id: 1,
                 amount: Some(dec!(5.0000)),
+                disputed: false,
             },
             &mut client_list,
             &mut transaction_list,
@@ -311,7 +360,83 @@ mod tests {
     }
 
     #[test]
-    fn dispute_should_() {
-        unimplemented!();
+    fn dispute_should_hold_the_amount_specified_in_the_target_transaction() {
+        let client_id = 1;
+        let mut client_list: ClientList = HashMap::new();
+        client_list.insert(client_id, Client::new(client_id));
+        let amount = dec!(5.0000);
+        let mut transaction_list: TransactionList = HashMap::new();
+        let deposit_transaction_id = 1;
+
+        handle_transaction(
+            Transaction {
+                transaction_type: TransactionType::Deposit,
+                client_id,
+                transaction_id: deposit_transaction_id,
+                amount: Some(amount),
+                disputed: false,
+            },
+            &mut client_list,
+            &mut transaction_list,
+        )
+        .unwrap();
+
+        handle_transaction(
+            Transaction {
+                transaction_type: TransactionType::Dispute,
+                client_id,
+                transaction_id: deposit_transaction_id,
+                amount: None,
+                disputed: false,
+            },
+            &mut client_list,
+            &mut transaction_list,
+        )
+        .unwrap();
+
+        let client = client_list.get(&client_id).unwrap();
+        assert_eq!(client.held_amount, amount);
+        assert_eq!(client.available_amount, dec!(0));
+        dbg!(client);
+    }
+
+    #[test]
+    fn resolve_releases_the_disputed_funds_and_references_the_transaction_given_by_the_tx() {
+        let client_id = 1;
+        let mut client_list: ClientList = HashMap::new();
+        client_list.insert(client_id, Client::new(client_id));
+        let mut transaction_list: TransactionList = HashMap::new();
+        let deposit_transaction_id = 1;
+
+        handle_transaction(
+            Transaction {
+                transaction_type: TransactionType::Deposit,
+                client_id,
+                transaction_id: deposit_transaction_id,
+                amount: Some(dec!(10.0000)),
+                disputed: false,
+            },
+            &mut client_list,
+            &mut transaction_list,
+        )
+        .unwrap();
+
+        handle_transaction(
+            Transaction {
+                transaction_type: TransactionType::Resolve,
+                client_id,
+                transaction_id: deposit_transaction_id,
+                amount: None,
+                disputed: false,
+            },
+            &mut client_list,
+            &mut transaction_list,
+        )
+        .unwrap();
+
+        let client = client_list.get(&client_id).unwrap();
+        assert_eq!(client.held_amount, dec!(0));
+        assert_eq!(client.available_amount, dec!(0));
+        dbg!(client);
     }
 }
